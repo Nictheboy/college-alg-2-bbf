@@ -13,6 +13,17 @@
 #include <limits>  // For std::numeric_limits
 #include <memory>  // For std::unique_ptr
 #include <numeric> // For std::accumulate
+#include <random>      // For std::mt19937, std::normal_distribution
+#include <unordered_map> // For std::unordered_map
+#include <unordered_set> // For std::unordered_set
+#include <algorithm>   // For std::transform
+
+// Structure to describe a dataset to be processed
+struct DatasetInfo {
+    std::string path_prefix;    // e.g., "data/", "data_100/"
+    std::string name_for_log;   // e.g., "data_K8", "data_K100"
+    // int expected_dimension; // Could be used for validation against K_dim from file if needed
+};
 
 // --- Point Structure (same as before) ---
 struct Point
@@ -409,116 +420,429 @@ public:
     }
 };
 
+// --- LSH Algorithm ---
+class LSHAlgorithm : public SearchAlgorithm
+{
+private:
+    int l_tables_;
+    int k_projections_per_table_;
+    int D_dimensions_;
+
+    // New structure for sum-based projection parameters
+    struct SumProjectionParams {
+        int start_dim;
+        int num_components;
+    };
+    std::vector<std::vector<SumProjectionParams>> sum_projection_definitions_;
+
+    std::vector<std::unordered_map<unsigned int, std::vector<int>>> hash_tables_;
+    std::vector<Point> indexed_points_; // Stores original points with int coordinates
+
+    std::mt19937 random_generator_;
+
+    // Helper to compute k-bit hash for a point using sum-based "projections"
+    unsigned int compute_hash_code(const std::vector<int>& point_coords, int table_idx) const
+    {
+        unsigned int hash_val = 0;
+        if (static_cast<size_t>(D_dimensions_) != point_coords.size() && !point_coords.empty()) {
+            // This case should ideally not happen if D_dimensions_ is set correctly
+            // and matches point_coords.size(). Handle error or return a default hash.
+            // For now, let's proceed, but this could indicate an issue.
+            // std::cerr << "Warning: compute_hash_code dimension mismatch. D=" << D_dimensions_ 
+            //           << ", point_coords.size()=" << point_coords.size() << std::endl;
+        }
+
+        for (int proj_idx = 0; proj_idx < k_projections_per_table_; ++proj_idx)
+        {
+            const SumProjectionParams& params = sum_projection_definitions_[table_idx][proj_idx];
+            long long current_sum = 0;
+
+            // Ensure params are valid for the actual point_coords size if it's smaller than D_dimensions_
+            int actual_dim_for_point = point_coords.size();
+            if (params.start_dim < actual_dim_for_point) {
+                 for (int d = 0; d < params.num_components; ++d)
+                 {
+                    if (params.start_dim + d < actual_dim_for_point)
+                    {
+                        current_sum += point_coords[params.start_dim + d];
+                    } else {
+                        break; // Stop if we go out of bounds for this specific point's coordinates
+                    }
+                 }
+            }
+            // else if point_coords is empty or start_dim is too large, current_sum remains 0.
+
+            if ((current_sum % 2) != 0) // Bit based on parity of the sum
+            {
+                hash_val |= (1U << proj_idx);
+            }
+        }
+        return hash_val;
+    }
+
+public:
+    LSHAlgorithm(int l, int k)
+        : l_tables_(l), k_projections_per_table_(k), D_dimensions_(0),
+          random_generator_(std::random_device{}())
+    {
+        if (k <= 0 || k > 32) {
+            throw std::invalid_argument("k (projections per table) must be > 0 and <= 32 for unsigned int hash.");
+        }
+    }
+
+    std::string get_name() const override
+    {
+        return "LSH_SumParity_l" + std::to_string(l_tables_) + "_k" + std::to_string(k_projections_per_table_);
+    }
+
+    void build(const std::vector<Point>& data_points, int k_dim_param) override
+    {
+        if (data_points.empty()) {
+            D_dimensions_ = k_dim_param;
+            indexed_points_.clear();
+            sum_projection_definitions_.clear();
+            hash_tables_.clear();
+            return;
+        }
+
+        D_dimensions_ = k_dim_param;
+        if (D_dimensions_ <= 0 && !data_points.empty()) { // Infer D_dimensions_ if not provided and points exist
+            D_dimensions_ = data_points[0].coordinates.size();
+            if (D_dimensions_ == 0 && !data_points.empty()) {
+                 throw std::runtime_error("LSH build: K_dim is 0 and points have 0 dimension.");
+            }
+        }
+         if (D_dimensions_ == 0 && data_points.empty()) { // No data and no k_dim, nothing to do.
+            // Or handle as an error if k_dim_param was expected to be >0.
+            // For now, just return, consistent with above.
+            return;
+        }
+
+        indexed_points_ = data_points;
+
+        sum_projection_definitions_.assign(l_tables_, std::vector<SumProjectionParams>(k_projections_per_table_));
+        hash_tables_.assign(l_tables_, std::unordered_map<unsigned int, std::vector<int>>());
+        hash_tables_.shrink_to_fit();
+
+        for (int i = 0; i < l_tables_; ++i)
+        {
+            for (int j = 0; j < k_projections_per_table_; ++j)
+            {
+                if (D_dimensions_ == 0) { // Should be caught by earlier checks
+                     throw std::runtime_error("LSH build: D_dimensions_ is 0 when trying to define sum projections.");
+                }
+                // Determine num_components: e.g., 1 to min(D_dimensions, 5)
+                std::uniform_int_distribution<int> num_components_dist(1, std::min(D_dimensions_, 5));
+                int num_c = num_components_dist(random_generator_);
+
+                // Determine start_dim
+                std::uniform_int_distribution<int> start_dim_dist(0, D_dimensions_ - num_c);
+                int start_d = start_dim_dist(random_generator_);
+                
+                sum_projection_definitions_[i][j] = {start_d, num_c};
+            }
+        }
+
+        for (size_t point_idx = 0; point_idx < indexed_points_.size(); ++point_idx)
+        {
+            // Use integer coordinates directly
+            const std::vector<int>& coords = indexed_points_[point_idx].coordinates;
+            if (coords.empty() && D_dimensions_ > 0) {
+                // A point has no coordinates but D_dimensions was specified.
+                // This is problematic. Skip hashing or handle as error.
+                // For now, if coords are empty, compute_hash_code will produce a hash (likely 0).
+            }
+            for (int table_idx = 0; table_idx < l_tables_; ++table_idx)
+            {
+                unsigned int hash_val = compute_hash_code(coords, table_idx);
+                hash_tables_[table_idx][hash_val].push_back(point_idx);
+            }
+        }
+    }
+
+    Point find_nearest(const Point& query_point) override
+    {
+        if (indexed_points_.empty() || D_dimensions_ == 0)
+        {
+            // If D_dimensions_ is 0, try to get from query_point, otherwise default to 0.
+            return Point(D_dimensions_ > 0 ? D_dimensions_ : (query_point.coordinates.empty() ? 0 : query_point.coordinates.size()) );
+        }
+
+        // Use integer coordinates directly for query
+        const std::vector<int>& query_coords = query_point.coordinates;
+        if (query_coords.empty() && D_dimensions_ > 0) {
+             // Query point has no coords but D_dimensions_ is set. Cannot compute meaningful hash.
+             // Return default point or handle error.
+             return Point(D_dimensions_);
+        }
+
+        std::unordered_set<int> candidate_indices;
+
+        for (int table_idx = 0; table_idx < l_tables_; ++table_idx)
+        {
+            unsigned int query_hash = compute_hash_code(query_coords, table_idx);
+            auto it = hash_tables_[table_idx].find(query_hash);
+            if (it != hash_tables_[table_idx].end())
+            {
+                for (int idx : it->second) // Reverted to loop insert by user
+                {
+                    candidate_indices.insert(idx);
+                }
+            }
+        }
+
+        if (candidate_indices.empty())
+        {
+             return Point(D_dimensions_);
+        }
+
+        // Logic reverted by user:
+        Point best_point = indexed_points_[*candidate_indices.begin()]; 
+        long long min_dist_sq = distance_sq(query_point, best_point);
+ 
+        auto cand_it = candidate_indices.begin();
+        std::advance(cand_it, 1); 
+ 
+        for (; cand_it != candidate_indices.end(); ++cand_it)
+        {
+            const Point& current_candidate = indexed_points_[*cand_it];
+            long long dist = distance_sq(query_point, current_candidate);
+            if (dist < min_dist_sq)
+            {
+                min_dist_sq = dist;
+                best_point = current_candidate;
+            }
+        }
+        return best_point;
+    }
+
+    long long get_space_usage_bytes() const override
+    {
+        long long space = 0;
+        // Space for sum_projection_definitions_
+        space += static_cast<long long>(l_tables_) * k_projections_per_table_ * sizeof(SumProjectionParams);
+        
+        // Indexed points (original integer coordinates)
+        if (!indexed_points_.empty()) {
+             // D_dimensions_ should be reliable here if build was called
+            size_t dim_to_use = D_dimensions_ > 0 ? D_dimensions_ : 0;
+            if (dim_to_use == 0 && !indexed_points_.empty() && !indexed_points_[0].coordinates.empty()){
+                dim_to_use = indexed_points_[0].coordinates.size();
+            }
+            space += static_cast<long long>(indexed_points_.size()) * 
+                     (static_cast<long long>(dim_to_use) * sizeof(int) + sizeof(int)); // coordinates + id
+        }
+
+        // Hash tables (same as before)
+        space += static_cast<long long>(l_tables_) * sizeof(std::unordered_map<unsigned int, std::vector<int>>);
+        for (const auto& table : hash_tables_)
+        {
+            for (const auto& pair : table)
+            {
+                space += sizeof(unsigned int); 
+                space += sizeof(std::vector<int>); 
+                space += static_cast<long long>(pair.second.capacity()) * sizeof(int); 
+            }
+        }
+        return space;
+    }
+
+    // Accuracy and distance ratio methods (copied from KDTreeApproximateAlgorithm)
+    double calculate_accuracy_percent(
+        const std::vector<Point>& queries,
+        const std::vector<Point>& algorithm_results,
+        const std::vector<Point>& ground_truth_results) const override
+    {
+        if (queries.empty()) return 100.0;
+        int accurate_queries_count = 0;
+        for (size_t i = 0; i < queries.size(); ++i)
+        {
+            const Point& query_pt = queries[i];
+            const Point& approx_result = algorithm_results[i];
+            const Point& exact_result = ground_truth_results[i];
+            long long dist_sq_approx = distance_sq(query_pt, approx_result);
+            long long dist_sq_exact = distance_sq(query_pt, exact_result);
+            if (dist_sq_exact == 0)
+            {
+                if (dist_sq_approx == 0) accurate_queries_count++;
+            }
+            else
+            {
+                double ratio = std::sqrt(static_cast<double>(dist_sq_approx)) / std::sqrt(static_cast<double>(dist_sq_exact));
+                if (ratio <= 1.05) accurate_queries_count++;
+            }
+        }
+        return (static_cast<double>(accurate_queries_count) / queries.size()) * 100.0;
+    }
+
+    double get_average_distance_ratio(
+        const std::vector<Point>& queries,
+        const std::vector<Point>& algorithm_results,
+        const std::vector<Point>& ground_truth_results) const override
+    {
+        if (queries.empty()) return 1.0;
+        double total_ratio = 0.0;
+        int valid_ratios_count = 0;
+        for (size_t i = 0; i < queries.size(); ++i)
+        {
+            const Point& query_pt = queries[i];
+            const Point& approx_result = algorithm_results[i];
+            const Point& exact_result = ground_truth_results[i];
+            long long dist_sq_approx = distance_sq(query_pt, approx_result);
+            long long dist_sq_exact = distance_sq(query_pt, exact_result);
+
+            if (dist_sq_exact == 0)
+            {
+                if (dist_sq_approx == 0) total_ratio += 1.0;
+                else continue; // Skip if exact is 0 but approx is not (infinite ratio)
+            }
+            else
+            {
+                total_ratio += std::sqrt(static_cast<double>(dist_sq_approx)) / std::sqrt(static_cast<double>(dist_sq_exact));
+            }
+            valid_ratios_count++;
+        }
+        if (valid_ratios_count == 0)
+        {
+            return queries.empty() ? 1.0 : std::numeric_limits<double>::quiet_NaN();
+        }
+        return total_ratio / valid_ratios_count;
+    }
+};
+
 int main()
 {
     std::ofstream results_file("results.txt");
-    results_file << "dataset_id,algorithm_name,build_time_ms,query_time_ms,accuracy_percent,avg_dist_ratio,space_bytes\n"; // Added avg_dist_ratio
+    // Updated header for results.txt
+    results_file << "dataset_name,file_id,algorithm_name,build_time_ms,query_time_ms,accuracy_percent,avg_dist_ratio,space_bytes\n";
     results_file << std::fixed << std::setprecision(6);
 
     const int MAX_BBF_ATTEMPTS = 200;
+    const int NUM_FILES_PER_DATASET = 100; // Assuming 100 files per dataset collection
 
-    for (int i = 1; i <= 100; ++i)
+    std::vector<DatasetInfo> datasets_to_process = {
+        // {"data/", "data_K_from_file"},      // Original dataset, K will be read from file
+        {"data_100/", "data_K100"},
+        {"data_500/", "data_K500"},
+        {"data_1000/", "data_K1000"}
+    };
+
+    for (const auto& ds_info : datasets_to_process)
     {
-        // ... (File reading logic same as before) ...
-        std::string filename = "data/" + std::to_string(i) + ".txt";
-        std::ifstream infile(filename);
-        if (!infile.is_open())
-        {
-            std::cerr << "Error opening file: " << filename << std::endl;
-            continue;
-        }
-        int N, M, K_dim;
-        infile >> N >> M >> K_dim;
-        std::vector<Point> build_points(N);
-        for (int j = 0; j < N; ++j)
-        {
-            build_points[j].id = j;
-            build_points[j].coordinates.resize(K_dim);
-            for (int k_idx = 0; k_idx < K_dim; ++k_idx)
-                infile >> build_points[j].coordinates[k_idx];
-        }
-        std::vector<Point> query_points(M);
-        for (int j = 0; j < M; ++j)
-        {
-            query_points[j].coordinates.resize(K_dim);
-            for (int k_idx = 0; k_idx < K_dim; ++k_idx)
-                infile >> query_points[j].coordinates[k_idx];
-        }
-        infile.close();
-        std::cout << "Processing dataset " << i << " (N=" << N << ", M=" << M << ", K=" << K_dim << ")" << std::endl;
+        std::cout << "\n===== Processing Dataset Collection: " << ds_info.name_for_log 
+                  << " from path " << ds_info.path_prefix << " =====" << std::endl;
 
-        // --- Ground Truth Generation (Brute Force) ---
-        BruteForceAlgorithm bf_alg;
-        // ... (BF timing and space calculation same as before) ...
-        double bf_build_time_ms = 0;
-        double bf_query_time_ms = 0;
-        long long bf_space_bytes = 0;
-        std::vector<Point> ground_truth_results;
-        ground_truth_results.reserve(M);
-        if (N > 0)
+        for (int i = 1; i <= NUM_FILES_PER_DATASET; ++i)
         {
-            auto build_start_time = std::chrono::high_resolution_clock::now();
-            bf_alg.build(build_points, K_dim);
-            auto build_end_time = std::chrono::high_resolution_clock::now();
-            bf_build_time_ms = std::chrono::duration<double, std::milli>(build_end_time - build_start_time).count();
-            bf_space_bytes = bf_alg.get_space_usage_bytes();
-            if (M > 0)
+            std::string filename = ds_info.path_prefix + std::to_string(i) + ".txt";
+            std::ifstream infile(filename);
+            if (!infile.is_open())
             {
-                auto query_start_time = std::chrono::high_resolution_clock::now();
-                for (const auto &q_pt : query_points)
-                    ground_truth_results.push_back(bf_alg.find_nearest(q_pt));
-                auto query_end_time = std::chrono::high_resolution_clock::now();
-                bf_query_time_ms = std::chrono::duration<double, std::milli>(query_end_time - query_start_time).count();
+                std::cerr << "Error opening file: " << filename << std::endl;
+                // Optionally, write an error entry to results.txt or skip this file
+                results_file << ds_info.name_for_log << "," << i << ",ERROR_OPENING_FILE,,,,,,\n";
+                continue;
             }
-        }
-        results_file << i << "," << bf_alg.get_name() << "," << bf_build_time_ms << "," << bf_query_time_ms << ","
-                     << "100.0" << "," << "1.0" << "," << bf_space_bytes << "\n"; // BF avg_dist_ratio is 1.0
-        std::cout << "  " << bf_alg.get_name() << ": Build=" << bf_build_time_ms << "ms, Query=" << bf_query_time_ms
-                  << "ms, Acc=100.0%, Ratio=1.0, Space=" << bf_space_bytes << "B" << std::endl;
+            int N, M, K_dim;
+            infile >> N >> M >> K_dim;
+            std::vector<Point> build_points(N);
+            for (int j = 0; j < N; ++j)
+            {
+                build_points[j].id = j;
+                build_points[j].coordinates.resize(K_dim);
+                for (int k_idx = 0; k_idx < K_dim; ++k_idx)
+                    infile >> build_points[j].coordinates[k_idx];
+            }
+            std::vector<Point> query_points(M);
+            for (int j = 0; j < M; ++j)
+            {
+                query_points[j].coordinates.resize(K_dim);
+                for (int k_idx = 0; k_idx < K_dim; ++k_idx)
+                    infile >> query_points[j].coordinates[k_idx];
+            }
+            infile.close();
+            std::cout << "Processing " << ds_info.name_for_log << " file " << i << " (N=" << N << ", M=" << M << ", K=" << K_dim << ")" << std::endl;
 
-        // --- List of Algorithms to Test ---
-        std::vector<std::unique_ptr<SearchAlgorithm>> algorithms_to_test;
-        algorithms_to_test.emplace_back(std::make_unique<KDTreeExactAlgorithm>(K_dim));
-        algorithms_to_test.emplace_back(std::make_unique<KDTreeApproximateAlgorithm>(K_dim, MAX_BBF_ATTEMPTS));
-
-        for (auto &alg_ptr : algorithms_to_test)
-        {
-            SearchAlgorithm &alg = *alg_ptr;
-            // ... (Timing and space calculation same as before) ...
-            double current_alg_build_time_ms = 0;
-            double current_alg_query_time_ms = 0;
-            long long current_alg_space_bytes = 0;
-            std::vector<Point> current_alg_results;
-            current_alg_results.reserve(M);
+            // --- Ground Truth Generation (Brute Force) ---
+            BruteForceAlgorithm bf_alg;
+            // ... (BF timing and space calculation same as before) ...
+            double bf_build_time_ms = 0;
+            double bf_query_time_ms = 0;
+            long long bf_space_bytes = 0;
+            std::vector<Point> ground_truth_results;
+            ground_truth_results.reserve(M);
             if (N > 0)
             {
                 auto build_start_time = std::chrono::high_resolution_clock::now();
-                alg.build(build_points, K_dim);
+                bf_alg.build(build_points, K_dim);
                 auto build_end_time = std::chrono::high_resolution_clock::now();
-                current_alg_build_time_ms = std::chrono::duration<double, std::milli>(build_end_time - build_start_time).count();
-                current_alg_space_bytes = alg.get_space_usage_bytes();
+                bf_build_time_ms = std::chrono::duration<double, std::milli>(build_end_time - build_start_time).count();
+                bf_space_bytes = bf_alg.get_space_usage_bytes();
                 if (M > 0)
                 {
                     auto query_start_time = std::chrono::high_resolution_clock::now();
                     for (const auto &q_pt : query_points)
-                        current_alg_results.push_back(alg.find_nearest(q_pt));
+                        ground_truth_results.push_back(bf_alg.find_nearest(q_pt));
                     auto query_end_time = std::chrono::high_resolution_clock::now();
-                    current_alg_query_time_ms = std::chrono::duration<double, std::milli>(query_end_time - query_start_time).count();
+                    bf_query_time_ms = std::chrono::duration<double, std::milli>(query_end_time - query_start_time).count();
                 }
             }
+            // Updated results file output for BruteForce
+            results_file << ds_info.name_for_log << "," << i << "," << bf_alg.get_name() << "," << bf_build_time_ms << "," << bf_query_time_ms << ","
+                         << "100.0" << "," << "1.0" << "," << bf_space_bytes << "\n";
+            std::cout << "  " << bf_alg.get_name() << " (file " << i << "): Build=" << bf_build_time_ms << "ms, Query=" << bf_query_time_ms
+                      << "ms, Acc=100.0%, Ratio=1.0, Space=" << bf_space_bytes << "B" << std::endl;
 
-            double accuracy_perc = 100.0;
-            double avg_ratio = 1.0;
-            if (M > 0 && N > 0)
+            // --- List of Algorithms to Test ---
+            std::vector<std::unique_ptr<SearchAlgorithm>> algorithms_to_test;
+            algorithms_to_test.emplace_back(std::make_unique<KDTreeExactAlgorithm>(K_dim));
+            algorithms_to_test.emplace_back(std::make_unique<KDTreeApproximateAlgorithm>(K_dim, MAX_BBF_ATTEMPTS));
+            algorithms_to_test.emplace_back(std::make_unique<LSHAlgorithm>(4, 5)); // l=4 tables, k=5 projections per table
+
+            for (auto &alg_ptr : algorithms_to_test)
             {
-                accuracy_perc = alg.calculate_accuracy_percent(query_points, current_alg_results, ground_truth_results);
-                avg_ratio = alg.get_average_distance_ratio(query_points, current_alg_results, ground_truth_results);
-            }
+                SearchAlgorithm &alg = *alg_ptr;
+                // ... (Timing and space calculation same as before) ...
+                double current_alg_build_time_ms = 0;
+                double current_alg_query_time_ms = 0;
+                long long current_alg_space_bytes = 0;
+                std::vector<Point> current_alg_results;
+                current_alg_results.reserve(M);
+                if (N > 0)
+                {
+                    auto build_start_time = std::chrono::high_resolution_clock::now();
+                    alg.build(build_points, K_dim);
+                    auto build_end_time = std::chrono::high_resolution_clock::now();
+                    current_alg_build_time_ms = std::chrono::duration<double, std::milli>(build_end_time - build_start_time).count();
+                    current_alg_space_bytes = alg.get_space_usage_bytes();
+                    if (M > 0)
+                    {
+                        auto query_start_time = std::chrono::high_resolution_clock::now();
+                        for (const auto &q_pt : query_points)
+                            current_alg_results.push_back(alg.find_nearest(q_pt));
+                        auto query_end_time = std::chrono::high_resolution_clock::now();
+                        current_alg_query_time_ms = std::chrono::duration<double, std::milli>(query_end_time - query_start_time).count();
+                    }
+                }
 
-            results_file << i << "," << alg.get_name() << "," << current_alg_build_time_ms << "," << current_alg_query_time_ms << ","
-                         << accuracy_perc << "," << avg_ratio << "," << current_alg_space_bytes << "\n";
-            std::cout << "  " << alg.get_name() << ": Build=" << current_alg_build_time_ms << "ms, Query=" << current_alg_query_time_ms
-                      << "ms, Acc=" << accuracy_perc << "%, Ratio=" << avg_ratio << ", Space=" << current_alg_space_bytes << "B" << std::endl;
+                double accuracy_perc = 100.0;
+                double avg_ratio = 1.0;
+                if (M > 0 && N > 0 && !ground_truth_results.empty() && !current_alg_results.empty())
+                {
+                    accuracy_perc = alg.calculate_accuracy_percent(query_points, current_alg_results, ground_truth_results);
+                    avg_ratio = alg.get_average_distance_ratio(query_points, current_alg_results, ground_truth_results);
+                }
+                else if (M > 0 && N > 0) { // If ground truth or alg results are empty but shouldn't be
+                     accuracy_perc = 0.0; // Or some other indicator of failure
+                     avg_ratio = std::numeric_limits<double>::quiet_NaN();
+                }
+
+                // Updated results file output for other algorithms
+                results_file << ds_info.name_for_log << "," << i << "," << alg.get_name() << "," << current_alg_build_time_ms << "," << current_alg_query_time_ms << ","
+                             << accuracy_perc << "," << avg_ratio << "," << current_alg_space_bytes << "\n";
+                std::cout << "  " << alg.get_name() << " (file " << i << "): Build=" << current_alg_build_time_ms << "ms, Query=" << current_alg_query_time_ms
+                          << "ms, Acc=" << accuracy_perc << "%, Ratio=" << avg_ratio << ", Space=" << current_alg_space_bytes << "B" << std::endl;
+            }
         }
     }
     results_file.close();
